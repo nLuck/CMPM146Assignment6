@@ -39,11 +39,6 @@ class TreeNode:
         valid_actions = state.get_actions()
         valid_actions_keys = {a.key() for a in valid_actions}
         
-        if state.verbose != Verbose.NO_LOG:
-            print("Child action keys:", list(self.children.keys()))
-            print("Valid action keys:", [a.key() for a in valid_actions])
-            print("Current hand:", [(c.name, c.upgrade_count) for c in state.hand])
-        
         best_action = None
         best_score = float('-inf')
         for action_key, child in self.children.items():
@@ -54,8 +49,6 @@ class TreeNode:
                     best_action = next(a for a in state.get_actions() if a.key() == action_key)
         
         if best_action is None:
-            if state.verbose != Verbose.NO_LOG:
-                print("No valid child actions found")
             for action in valid_actions:
                 if isinstance(action.to_action(state), EndAgentTurn):
                     return action
@@ -84,11 +77,7 @@ class TreeNode:
         # if node not fully expanded, expand it
         available_actions = state.get_actions()
         valid_action_keys = {a.key() for a in available_actions}
-        
-        if state.verbose != Verbose.NO_LOG:
-            print("select: Available action keys:", [a.key() for a in available_actions])
-            print("select: Current hand:", [(c.name, c.upgrade_count) for c in state.hand])
-        
+
         self.children = {k: v for k, v in self.children.items() if k in valid_action_keys}
         
         unexplored = [a for a in available_actions if a.key() not in self.children]
@@ -97,8 +86,6 @@ class TreeNode:
             return
         
         if not self.children:
-            if state.verbose != Verbose.NO_LOG:
-                print("select: no children to select")
             return
         
         total_visits = self.visits
@@ -124,9 +111,7 @@ class TreeNode:
         child = self.children[child_key]
         
         if child.action.key() not in valid_action_keys:
-            if state.verbose != Verbose.NO_LOG:
-                print(f"select: invalid child action {child.action.key()}")
-                return
+            return
         
         next_state = state.copy_undeterministic()
         next_state.step(child.action)
@@ -149,26 +134,53 @@ class TreeNode:
 
     # RECOMMENDED: rollout plays the game randomly until its conclusion, and then 
     # calls backpropagate with the result you get 
-    def rollout(self, state):
+    def rollout(self, state: BattleState):
         current_state = state.copy_undeterministic()
+        
         while not current_state.ended():
+            enemy_intent = current_state.enemies[0].get_intention(current_state.game_state, current_state) if current_state.enemies else None
+            intent_damage = self.get_intent_damage(enemy_intent)
             actions = current_state.get_actions()
             preferred = []
             for action in actions:
-                if action.card:
+                score = 0
+                if isinstance(action, EndAgentTurn):
+                    if current_state.health() <= intent_damage and intent_damage > 0:
+                        score = -10
+                    else:
+                        score = 0
+                elif action.card is not None:
                     card_name = action.card[0]
-                    if card_name in ["Bludgeon", "Thunderclap", "Bash"] and current_state.mana >= 2:
-                        preferred.append(action)
-                    elif card_name == "Thunderclap" or card_name == "Inflame":
-                        preferred.append(action)
-                    elif card_name == "Defend" and current_state.health() < 0.4:
-                        preferred.append(action)
-                    elif card_name != "Offering" or current_state.health() > 0.5:
-                        preferred.append(action)
-            if preferred and random.random() < 0.8:
-                action = random.choice(preferred)
-            else:
-                action = random.choice(actions)
+                    if card_name == "Bludgeon":
+                        score += 32 * (2 if current_state.enemies[0].status_effect_state.has(StatusEffectRepo.VULNERABLE) > 0 else 1)
+                    elif card_name == "SearingBlow":
+                        score += 12 * (2 if current_state.enemies[0].status_effect_state.has(StatusEffectRepo.VULNERABLE) > 0 else 1)
+                    elif card_name == "Bash":
+                        score += 8 + 10
+                    elif card_name == "Thunderclap":
+                        score += 4 + 10
+                    elif card_name == "Strike":
+                        score += 6 * (2 if current_state.enemies[0].status_effect_state.has(StatusEffectRepo.VULNERABLE) > 0 else 1)
+                    elif card_name == "Offering":
+                        if current_state.health() > 6 + intent_damage:
+                            score += 10
+                        else:
+                            score = -5
+                    elif card_name == "Defend":
+                        if intent_damage >= current_state.health():
+                            score += 5
+                    elif card_name == "Inflame":
+                        score += 10
+                    elif card_name == "PommelStrike":
+                        score += 9 + 2
+                else:
+                    score = 0
+                preferred.append((action, score))
+            
+            max_score = max(score for _, score in preferred)
+            best_actions = [action for action, score in preferred if score == max_score]
+            action = random.choice(best_actions)
+            
             current_state.step(action)
         return self.score(current_state)
         
@@ -192,15 +204,15 @@ class TreeNode:
         score = state.score()
         health_weight = 0.6 if health < 0.3 else 0.4 if health < 0.5 else 0.2
         health_penalty = -0.3 if health < 0.1 else -0.1 if health < 0.2 else 0.0
-        status_bonus = 0.0
-        for enemy in state.enemies:
-            if enemy.status_effect_state.has(StatusEffectRepo.VULNERABLE):
-                status_bonus += 0.15
-        if state.player.status_effect_state.has(StatusEffectRepo.STRENGTH):
-            status_bonus += 0.15
-        bludgeon_bonus = 0.2 if any(a.card and a.card[0] in ["Bludgeon", "SearingBlow"] and state.mana >= 3 for a in state.get_actions()) else 0.0
-        return (1 - health_weight) * score + health_weight * health + health_penalty + status_bonus + bludgeon_bonus
-        
+        return (1 - health_weight) * score + health_weight * health + health_penalty
+    
+    def get_intent_damage(self, intent):
+        if not intent:
+            return 0
+        from action.agent_targeted_action import DealAttackDamage
+        if isinstance(intent, DealAttackDamage):
+            return intent.values[0].peek()
+        return 0
         
 # You do not have to modify the MCTS Agent (but you can)
 class MCTSAgent(GGPA):
